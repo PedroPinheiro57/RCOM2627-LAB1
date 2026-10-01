@@ -12,6 +12,109 @@
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
 
+// Frame fields
+#define FLAG 0x7E
+#define A_TX 0x03 // commands sent by Tx / replies sent by Rx
+#define A_RX 0x01 // commands sent by Rx / replies sent by Tx
+#define C_SET 0x03
+#define C_UA 0x07
+
+typedef enum
+{
+    START,
+    FLAG_RCV,
+    A_RCV,
+    C_RCV,
+    BCC_OK,
+    STOP
+} State;
+
+////////////////////////////////////////////////
+// SUPERVISION FRAME HELPERS
+////////////////////////////////////////////////
+
+static int sendSupervisionFrame(unsigned char a, unsigned char c)
+{
+    unsigned char frame[5] = {FLAG, a, c, a ^ c, FLAG};
+
+    int bytes = writeBytesSerialPort(frame, 5);
+
+    printf("Frame sent: %d bytes\n", bytes);
+    for (int i = 0; i < 5; i++)
+    {
+        printf("TX byte = 0x%02X\n", frame[i]);
+    }
+
+    return bytes == 5 ? 0 : -1;
+}
+
+static int readSupervisionFrame(unsigned char expectedA, unsigned char expectedC)
+{
+    State state = START;
+    unsigned char byte;
+
+    while (state != STOP)
+    {
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes <= 0)
+        {
+            printf("Error reading from serial port\n");
+            return -1;
+        }
+
+        printf("RX byte = 0x%02X\n", byte);
+
+        switch (state)
+        {
+        case START:
+            if (byte == FLAG)
+                state = FLAG_RCV;
+            // Other_RCV: stay in START
+            break;
+
+        case FLAG_RCV:
+            if (byte == expectedA)
+                state = A_RCV;
+            else if (byte == FLAG)
+                state = FLAG_RCV;
+            else
+                state = START;
+            break;
+
+        case A_RCV:
+            if (byte == expectedC)
+                state = C_RCV;
+            else if (byte == FLAG)
+                state = FLAG_RCV;
+            else
+                state = START;
+            break;
+
+        case C_RCV:
+            if (byte == (expectedA ^ expectedC)) // A ^ C = BCC
+                state = BCC_OK;
+            else if (byte == FLAG)
+                state = FLAG_RCV;
+            else
+                state = START;
+            break;
+
+        case BCC_OK:
+            if (byte == FLAG)
+                state = STOP;
+            else
+                state = START;
+            break;
+
+        case STOP:
+            break;
+        }
+    }
+
+    return 0;
+}
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -25,57 +128,21 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // SET frame: FLAG | A | C | BCC1 | FLAG
-    unsigned char setFrame[5];
-
-    setFrame[0] = 0x7E;                   
-    setFrame[1] = 0x03;                   
-    setFrame[2] = 0x03;                    
-    setFrame[3] = setFrame[1] ^ setFrame[2]; 
-    setFrame[4] = 0x7E;                   
-
-    int bytes = writeBytesSerialPort(setFrame, 5);
-
-    printf("SET frame sent: %d bytes\n", bytes);
-
-    for (int i = 0; i < 5; i++)
+    // Send SET
+    if (sendSupervisionFrame(A_TX, C_SET) < 0)
     {
-        printf("TX byte = 0x%02X\n", setFrame[i]);
-    }
-
-    // Receive UA
-    unsigned char uaFrame[5];
-
-    for (int i = 0; i < 5; i++)
-    {
-        bytes = readByteSerialPort(&uaFrame[i]);
-
-        if (bytes <= 0)
-        {
-            printf("Error receiving UA frame\n");
-            return -1;
-        }
-
-        printf("RX byte = 0x%02X\n", uaFrame[i]);
-    }
-
-    // Check UA frame
-    unsigned char expectedBCC = uaFrame[1] ^ uaFrame[2];
-
-    if (uaFrame[0] == 0x7E &&
-        uaFrame[1] == 0x01 &&
-        uaFrame[2] == 0x07 &&
-        uaFrame[3] == expectedBCC &&
-        uaFrame[4] == 0x7E)
-    {
-        printf("Valid UA frame received\n");
-    }
-    else
-    {
-        printf("Invalid UA frame received\n");
+        printf("Error sending SET frame\n");
         return -1;
     }
 
+    // Wait for UA
+    if (readSupervisionFrame(A_RX, C_UA) < 0)
+    {
+        printf("Error receiving UA frame\n");
+        return -1;
+    }
+
+    printf("Valid UA frame received\n");
     printf("Connection established!\n");
 
     return 0;
@@ -91,56 +158,20 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Receive SET
-    unsigned char setFrame[5];
-
-    for (int i = 0; i < 5; i++)
+    // Wait for SET
+    if (readSupervisionFrame(A_TX, C_SET) < 0)
     {
-        int bytes = readByteSerialPort(&setFrame[i]);
-
-        if (bytes <= 0)
-        {
-            printf("Error receiving SET frame\n");
-            return -1;
-        }
-
-        printf("RX byte = 0x%02X\n", setFrame[i]);
-    }
-
-    // Check SET frame
-    unsigned char expectedBCC = setFrame[1] ^ setFrame[2];
-
-    if (setFrame[0] == 0x7E &&
-        setFrame[1] == 0x03 &&
-        setFrame[2] == 0x03 &&
-        setFrame[3] == expectedBCC &&
-        setFrame[4] == 0x7E)
-    {
-        printf("Valid SET frame received\n");
-    }
-    else
-    {
-        printf("Invalid SET frame received\n");
+        printf("Error receiving SET frame\n");
         return -1;
     }
 
-    // UA frame: FLAG | A | C | BCC1 | FLAG
-    unsigned char uaFrame[5];
-
-    uaFrame[0] = 0x7E;
-    uaFrame[1] = 0x01;
-    uaFrame[2] = 0x07;
-    uaFrame[3] = uaFrame[1] ^ uaFrame[2];
-    uaFrame[4] = 0x7E;
+    printf("Valid SET frame received\n");
 
     // Send UA
-    int bytes = writeBytesSerialPort(uaFrame, 5);
-
-    printf("UA frame sent: %d bytes\n", bytes);
-
-    for (int i = 0; i < 5; i++)
+    if (sendSupervisionFrame(A_RX, C_UA) < 0)
     {
-        printf("TX byte = 0x%02X\n", uaFrame[i]);
+        printf("Error sending UA frame\n");
+        return -1;
     }
 
     printf("Connection established!\n");
