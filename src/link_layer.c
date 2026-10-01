@@ -5,6 +5,7 @@
 #include "link_layer.h"
 #include "serial_port.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -28,6 +29,19 @@ typedef enum
     BCC_OK,
     STOP
 } State;
+
+////////////////////////////////////////////////
+// ALARM
+////////////////////////////////////////////////
+int alarmEnabled = FALSE;
+int alarmCount = 0;
+
+void alarmHandler(int signal)
+{
+    alarmEnabled = FALSE;
+    alarmCount++;
+    printf("Alarm #%d received\n", alarmCount);
+}
 
 ////////////////////////////////////////////////
 // SUPERVISION FRAME HELPERS
@@ -128,24 +142,39 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Send SET
-    if (sendSupervisionFrame(A_TX, C_SET) < 0)
+    // Install the alarm handler
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
     {
-        printf("Error sending SET frame\n");
+        perror("sigaction");
         return -1;
     }
 
-    // Wait for UA
-    if (readSupervisionFrame(A_RX, C_UA) < 0)
+    int tries = 0;
+    while (tries <= llParameters.nRetransmissions)
     {
-        printf("Error receiving UA frame\n");
-        return -1;
+        // Send SET and start the timer
+        sendSupervisionFrame(A_TX, C_SET);
+        alarmEnabled = TRUE;
+        alarm(llParameters.timeout);
+
+        // Wait for UA. If the alarm fires, read() is interrupted
+        // and readSupervisionFrame returns -1.
+        if (readSupervisionFrame(A_RX, C_UA) == 0)
+        {
+            alarm(0); // UA received: cancel the timer
+            printf("Connection established!\n");
+            return 0;
+        }
+
+        tries++;
+        printf("No UA, retransmitting SET\n");
     }
 
-    printf("Valid UA frame received\n");
-    printf("Connection established!\n");
-
-    return 0;
+    printf("Failed after %d tries\n", tries);
+    closeSerialPort();
+    return -1;
 }
 
 int llOpenRx(LinkLayer llParameters)
